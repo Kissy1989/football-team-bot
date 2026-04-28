@@ -31,7 +31,7 @@ ADMIN_IDS = {
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError(
-        "Заполните API_ID, API_HASH и BOT_TOKEN в .env. "
+        "Заполните API_ID, API_HASH и BOT_TOKEN в .env или Railway Variables. "
         "Смотрите .env.example"
     )
 
@@ -77,6 +77,8 @@ PROFILE_STEPS = [
 
 # Простой FSM в памяти. После перезапуска недозаполненные анкеты сбросятся.
 profile_sessions: dict[int, dict[str, Any]] = {}
+
+PLAYERS_PER_PAGE = 20
 
 
 @dataclass
@@ -355,9 +357,28 @@ def get_player(user_id: int) -> Optional[Player]:
     return row_to_player(row) if row else None
 
 
+def get_all_players() -> list[Player]:
+    rows = db.execute(
+        """
+        SELECT *
+        FROM players
+        ORDER BY overall_rating DESC, name COLLATE NOCASE ASC
+        """
+    ).fetchall()
+    return [row_to_player(row) for row in rows]
+
+
+def get_players_count() -> int:
+    row = db.execute("SELECT COUNT(*) AS cnt FROM players").fetchone()
+    return int(row["cnt"])
+
+
 def format_player_profile(player: Player) -> str:
+    username_line = f"🔗 Username: @{player.username}\n" if player.username else ""
     return (
         f"👤 **{player.name}**\n"
+        f"{username_line}"
+        f"🆔 ID: `{player.telegram_id}`\n"
         f"🎯 Основная позиция: {position_text(player.main_position)}\n"
         f"🔁 Доп. позиция: {position_text(player.second_position)}\n\n"
         f"⚡ Скорость: {player.speed}\n"
@@ -390,11 +411,28 @@ async def require_admin(message: Message) -> bool:
         return False
 
     if message.chat.type == ChatType.PRIVATE:
-        return message.from_user.id in ADMIN_IDS
+        ok = message.from_user.id in ADMIN_IDS
+    else:
+        ok = await is_admin(app, message.chat.id, message.from_user.id)
 
-    ok = await is_admin(app, message.chat.id, message.from_user.id)
     if not ok:
         await message.reply_text("⛔ Эту команду может использовать только админ.")
+    return ok
+
+
+async def require_admin_callback(query: CallbackQuery) -> bool:
+    if query.message is None or query.message.chat is None:
+        await query.answer("Не могу проверить права.", show_alert=True)
+        return False
+
+    chat = query.message.chat
+    if chat.type == ChatType.PRIVATE:
+        ok = query.from_user.id in ADMIN_IDS
+    else:
+        ok = await is_admin(app, chat.id, query.from_user.id)
+
+    if not ok:
+        await query.answer("⛔ Только админ может выбирать игроков.", show_alert=True)
     return ok
 
 
@@ -410,10 +448,10 @@ def get_open_match(chat_id: int) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
-def create_match(chat_id: int, created_by: int) -> int:
+def create_match(chat_id: int, created_by: int) -> tuple[int, bool]:
     active = get_open_match(chat_id)
     if active:
-        return int(active["id"])
+        return int(active["id"]), False
 
     cursor = db.execute(
         """
@@ -423,10 +461,10 @@ def create_match(chat_id: int, created_by: int) -> int:
         (chat_id, created_by, today_str(), now_iso()),
     )
     db.commit()
-    return int(cursor.lastrowid)
+    return int(cursor.lastrowid), True
 
 
-def set_match_player(match_id: int, player_id: int, status: str) -> None:
+def set_match_player(match_id: int, player_id: int, status: str = "playing") -> None:
     db.execute(
         """
         INSERT INTO match_players (match_id, player_id, status, joined_at)
@@ -440,6 +478,31 @@ def set_match_player(match_id: int, player_id: int, status: str) -> None:
     db.commit()
 
 
+def remove_match_player(match_id: int, player_id: int) -> None:
+    db.execute(
+        "DELETE FROM match_players WHERE match_id = ? AND player_id = ?",
+        (match_id, player_id),
+    )
+    db.commit()
+
+
+def clear_match_players(match_id: int) -> None:
+    db.execute("DELETE FROM match_players WHERE match_id = ?", (match_id,))
+    db.commit()
+
+
+def get_selected_player_ids(match_id: int) -> set[int]:
+    rows = db.execute(
+        """
+        SELECT player_id
+        FROM match_players
+        WHERE match_id = ? AND status = 'playing'
+        """,
+        (match_id,),
+    ).fetchall()
+    return {int(row["player_id"]) for row in rows}
+
+
 def get_match_players(match_id: int, status: Optional[str] = None) -> list[Player]:
     if status:
         rows = db.execute(
@@ -448,7 +511,7 @@ def get_match_players(match_id: int, status: Optional[str] = None) -> list[Playe
             FROM match_players mp
             JOIN players p ON p.telegram_id = mp.player_id
             WHERE mp.match_id = ? AND mp.status = ?
-            ORDER BY p.overall_rating DESC
+            ORDER BY p.overall_rating DESC, p.name COLLATE NOCASE ASC
             """,
             (match_id, status),
         ).fetchall()
@@ -459,7 +522,7 @@ def get_match_players(match_id: int, status: Optional[str] = None) -> list[Playe
             FROM match_players mp
             JOIN players p ON p.telegram_id = mp.player_id
             WHERE mp.match_id = ?
-            ORDER BY mp.status, p.overall_rating DESC
+            ORDER BY mp.status, p.overall_rating DESC, p.name COLLATE NOCASE ASC
             """,
             (match_id,),
         ).fetchall()
@@ -467,41 +530,139 @@ def get_match_players(match_id: int, status: Optional[str] = None) -> list[Playe
     return [row_to_player(row) for row in rows]
 
 
-def match_keyboard(match_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Я играю", callback_data=f"join:{match_id}"),
-                InlineKeyboardButton("❌ Не играю", callback_data=f"leave:{match_id}"),
-            ],
-            [
-                InlineKeyboardButton("📋 Список игроков", callback_data=f"list:{match_id}"),
-            ],
-        ]
+def short_name(player: Player, limit: int = 22) -> str:
+    name = player.name.strip()
+    if len(name) <= limit:
+        return name
+    return name[: limit - 1] + "…"
+
+
+def selection_keyboard(match_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    players = get_all_players()
+    selected_ids = get_selected_player_ids(match_id)
+
+    total_pages = max(1, (len(players) + PLAYERS_PER_PAGE - 1) // PLAYERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PLAYERS_PER_PAGE
+    current_players = players[start:start + PLAYERS_PER_PAGE]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for player in current_players:
+        mark = "✅" if player.telegram_id in selected_ids else "➕"
+        text = (
+            f"{mark} {short_name(player)} "
+            f"{player.main_position} ⭐{player.overall_rating} 🧤{player.goalkeeper_skill}"
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                text,
+                callback_data=f"toggle:{match_id}:{page}:{player.telegram_id}",
+            )
+        ])
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"selpage:{match_id}:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"selpage:{match_id}:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([
+        InlineKeyboardButton("📋 Список выбранных", callback_data=f"selected:{match_id}:{page}"),
+        InlineKeyboardButton("✅ Готово", callback_data=f"done:{match_id}:{page}"),
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def selection_text(match_id: int, page: int = 0) -> str:
+    total_players = get_players_count()
+    selected_count = len(get_match_players(match_id, "playing"))
+    total_pages = max(1, (total_players + PLAYERS_PER_PAGE - 1) // PLAYERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    return (
+        f"👥 **Выбор игроков на матч #{match_id}**\n\n"
+        f"Всего профилей в боте: **{total_players}**\n"
+        f"Админ выбрал на игру: **{selected_count}**\n"
+        f"Страница: **{page + 1}/{total_pages}**\n\n"
+        "Нажимайте на игроков: ✅ выбран, ➕ не выбран.\n"
+        "Обычные игроки сами записаться не могут."
     )
 
 
 def format_players_list(match_id: int) -> str:
     playing = get_match_players(match_id, "playing")
-    not_playing = get_match_players(match_id, "not_playing")
 
-    lines = [f"📋 **Список на игру #{match_id}**\n"]
+    lines = [f"📋 **Список игроков на матч #{match_id}**\n"]
+    lines.append(f"Админ выбрал: **{len(playing)}**")
 
-    lines.append(f"✅ Играют: **{len(playing)}**")
     if playing:
         for index, player in enumerate(playing, 1):
+            username = f" @{player.username}" if player.username else ""
             lines.append(
-                f"{index}. {player.name} — {position_text(player.main_position)} — ⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
+                f"{index}. {player.name}{username} — {position_text(player.main_position)} — "
+                f"⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
             )
     else:
-        lines.append("Пока никто не записался.")
-
-    if not_playing:
-        lines.append(f"\n❌ Не играют: **{len(not_playing)}**")
-        for index, player in enumerate(not_playing, 1):
-            lines.append(f"{index}. {player.name}")
+        lines.append("Пока никого не выбрали. Админ может написать /select_players")
 
     return "\n".join(lines)
+
+
+def format_all_profiles() -> str:
+    players = get_all_players()
+    if not players:
+        return "Пока нет профилей. Игроки должны написать боту в личку: /new_profile"
+
+    lines = [f"👥 **Все профили игроков: {len(players)}**\n"]
+    for index, player in enumerate(players, 1):
+        username = f" @{player.username}" if player.username else ""
+        lines.append(
+            f"{index}. {player.name}{username}\n"
+            f"   ID: `{player.telegram_id}` | {position_text(player.main_position)} | "
+            f"⭐ {player.overall_rating} | 🧤 {player.goalkeeper_skill}"
+        )
+    return "\n".join(lines)
+
+
+def find_players_by_query(query: str) -> list[Player]:
+    query = query.strip()
+    if not query:
+        return []
+
+    if query.isdigit():
+        player = get_player(int(query))
+        return [player] if player else []
+
+    if query.startswith("@"):
+        username = query[1:].strip().lower()
+        rows = db.execute(
+            "SELECT * FROM players WHERE lower(username) = ?",
+            (username,),
+        ).fetchall()
+        return [row_to_player(row) for row in rows]
+
+    # Поиск по имени: точное совпадение сначала, потом похожие.
+    exact_rows = db.execute(
+        "SELECT * FROM players WHERE lower(name) = ? ORDER BY overall_rating DESC",
+        (query.lower(),),
+    ).fetchall()
+    if exact_rows:
+        return [row_to_player(row) for row in exact_rows]
+
+    like_rows = db.execute(
+        """
+        SELECT *
+        FROM players
+        WHERE lower(name) LIKE ?
+        ORDER BY overall_rating DESC, name COLLATE NOCASE ASC
+        LIMIT 10
+        """,
+        (f"%{query.lower()}%",),
+    ).fetchall()
+    return [row_to_player(row) for row in like_rows]
 
 
 def goalkeeper_score(player: Player) -> int:
@@ -670,8 +831,16 @@ def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Pl
                 if a_player in selected_gks or b_player in selected_gks:
                     continue
 
-                new_stronger_total = total_a - a_player.overall_rating + b_player.overall_rating if stronger is team_a else total_b - a_player.overall_rating + b_player.overall_rating
-                new_weaker_total = total_b - b_player.overall_rating + a_player.overall_rating if weaker is team_b else total_a - b_player.overall_rating + a_player.overall_rating
+                new_stronger_total = (
+                    total_a - a_player.overall_rating + b_player.overall_rating
+                    if stronger is team_a
+                    else total_b - a_player.overall_rating + b_player.overall_rating
+                )
+                new_weaker_total = (
+                    total_b - b_player.overall_rating + a_player.overall_rating
+                    if weaker is team_b
+                    else total_a - b_player.overall_rating + a_player.overall_rating
+                )
                 new_diff = abs(new_stronger_total - new_weaker_total)
 
                 if new_diff < best_diff:
@@ -696,7 +865,8 @@ def format_team(name: str, team: list[Player]) -> str:
     for index, player in enumerate(team, 1):
         gk_mark = " 🧤" if player.main_position == "GK" or player.second_position == "GK" or player.goalkeeper_skill >= 60 else ""
         lines.append(
-            f"{index}. {player.name}{gk_mark} — {position_text(player.main_position)} — ⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
+            f"{index}. {player.name}{gk_mark} — {position_text(player.main_position)} — "
+            f"⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
         )
 
     lines.append(
@@ -724,18 +894,20 @@ def format_balanced_teams(team_a: list[Player], team_b: list[Player]) -> str:
 
 @app.on_message(filters.command("start"))
 async def start_handler(_: Client, message: Message) -> None:
-    text = (
-        "⚽ Привет! Я бот для футбольной группы.\n\n"
-        "Игроки:\n"
-        "/new_profile — создать или обновить FIFA-профиль\n"
-        "/profile — посмотреть свой профиль\n\n"
-        "Админ в группе:\n"
-        "/create_match — создать матч с кнопками\n"
-        "/players_today — список игроков\n"
-        "/balance — поделить на команды\n"
-        "/shuffle — новый вариант команд\n"
-        "/reset_match — сбросить текущий матч"
-    )
+    if message.chat.type == ChatType.PRIVATE:
+        text = (
+            "⚽ Привет! Я бот для футбольной группы.\n\n"
+            "Игроки могут только создать или обновить профиль:\n"
+            "/new_profile — создать или обновить FIFA-профиль\n"
+            "/profile — посмотреть свой профиль\n\n"
+            "Матч и список игроков выбирает только админ в группе."
+        )
+    else:
+        text = (
+            "⚽ Бот работает.\n\n"
+            "Игроки создают профиль в личке бота: /new_profile\n"
+            "Матч и список игроков выбирает только админ."
+        )
     await message.reply_text(text)
 
 
@@ -810,8 +982,15 @@ async def profile_text_handler(_: Client, message: Message) -> None:
         )
         return
 
-    next_field, next_question = PROFILE_STEPS[session["step"]]
+    _next_field, next_question = PROFILE_STEPS[session["step"]]
     await message.reply_text(next_question)
+
+
+@app.on_message(filters.command(["profiles", "all_players"]))
+async def profiles_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+    await message.reply_text(format_all_profiles())
 
 
 @app.on_message(filters.group & filters.command("create_match"))
@@ -819,24 +998,163 @@ async def create_match_handler(_: Client, message: Message) -> None:
     if not await require_admin(message):
         return
 
-    match_id = create_match(message.chat.id, message.from_user.id)
+    match_id, created = create_match(message.chat.id, message.from_user.id)
+    if created:
+        header = f"⚽ **Матч #{match_id} создан**"
+    else:
+        header = f"⚽ **Уже есть открытый матч #{match_id}**"
+
     await message.reply_text(
-        f"⚽ **Игра сегодня / ближайшая среда**\n\n"
-        f"Матч #{match_id}\n"
-        "Кто играет? Нажмите кнопку ниже.\n\n"
-        "Перед записью игрок должен создать профиль в личке бота: /new_profile",
-        reply_markup=match_keyboard(match_id),
+        f"{header}\n\n"
+        "Игроки сами не записываются.\n"
+        "Только админ выбирает список игроков из готовых профилей.\n\n"
+        "Нажимайте на игроков ниже или используйте команду /select_players.",
+        reply_markup=selection_keyboard(match_id, page=0),
+    )
+
+
+@app.on_message(filters.group & filters.command("select_players"))
+async def select_players_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала админ должен написать /create_match")
+        return
+
+    await message.reply_text(
+        selection_text(active["id"], page=0),
+        reply_markup=selection_keyboard(active["id"], page=0),
     )
 
 
 @app.on_message(filters.group & filters.command("players_today"))
 async def players_today_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
     active = get_open_match(message.chat.id)
     if not active:
         await message.reply_text("Пока нет открытого матча. Админ может написать /create_match")
         return
 
     await message.reply_text(format_players_list(active["id"]))
+
+
+@app.on_message(filters.group & filters.command("add_player"))
+async def add_player_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text(
+            "Напиши так:\n"
+            "`/add_player ID`\n"
+            "или:\n"
+            "`/add_player @username`\n"
+            "или:\n"
+            "`/add_player имя`\n\n"
+            "Посмотреть ID можно командой /profiles"
+        )
+        return
+
+    query = parts[1].strip()
+    # Если админ вставил несколько ID через пробел/запятую — добавляем всех.
+    tokens = [x.strip() for x in query.replace(",", " ").split() if x.strip()]
+    if len(tokens) > 1 and all(t.isdigit() or t.startswith("@") for t in tokens):
+        added = []
+        not_found = []
+        for token in tokens:
+            found = find_players_by_query(token)
+            if len(found) == 1:
+                set_match_player(active["id"], found[0].telegram_id, "playing")
+                added.append(found[0].name)
+            else:
+                not_found.append(token)
+        text = ""
+        if added:
+            text += "✅ Добавлены:\n" + "\n".join(f"• {name}" for name in added)
+        if not_found:
+            text += "\n\nНе нашел:\n" + "\n".join(f"• {token}" for token in not_found)
+        await message.reply_text(text or "Никого не добавил.")
+        return
+
+    found_players = find_players_by_query(query)
+    if not found_players:
+        await message.reply_text("Не нашел такого игрока. Посмотрите список профилей командой /profiles")
+        return
+
+    if len(found_players) > 1:
+        lines = ["Нашел несколько игроков. Добавьте по ID:"]
+        for player in found_players:
+            lines.append(f"• {player.name} — ID: `{player.telegram_id}` — ⭐ {player.overall_rating}")
+        await message.reply_text("\n".join(lines))
+        return
+
+    player = found_players[0]
+    set_match_player(active["id"], player.telegram_id, "playing")
+    await message.reply_text(f"✅ Добавил на матч: {player.name}")
+
+
+@app.on_message(filters.group & filters.command("remove_player"))
+async def remove_player_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text(
+            "Напиши так:\n"
+            "`/remove_player ID`\n"
+            "или:\n"
+            "`/remove_player @username`\n"
+            "или:\n"
+            "`/remove_player имя`"
+        )
+        return
+
+    query = parts[1].strip()
+    found_players = find_players_by_query(query)
+    if not found_players:
+        await message.reply_text("Не нашел такого игрока.")
+        return
+
+    if len(found_players) > 1:
+        lines = ["Нашел несколько игроков. Удалите по ID:"]
+        for player in found_players:
+            lines.append(f"• {player.name} — ID: `{player.telegram_id}` — ⭐ {player.overall_rating}")
+        await message.reply_text("\n".join(lines))
+        return
+
+    player = found_players[0]
+    remove_match_player(active["id"], player.telegram_id)
+    await message.reply_text(f"➖ Убрал с матча: {player.name}")
+
+
+@app.on_message(filters.group & filters.command("clear_players"))
+async def clear_players_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Открытого матча нет.")
+        return
+
+    clear_match_players(active["id"])
+    await message.reply_text("🧹 Список игроков на текущий матч очищен.")
 
 
 @app.on_message(filters.group & filters.command("balance"))
@@ -895,10 +1213,20 @@ async def reset_match_handler(_: Client, message: Message) -> None:
     await message.reply_text("♻️ Текущий матч сброшен. Можно создать новый через /create_match")
 
 
-@app.on_callback_query(filters.regex(r"^(join|leave|list):\d+$"))
-async def callback_handler(_: Client, query: CallbackQuery) -> None:
-    action, match_id_raw = query.data.split(":")
-    match_id = int(match_id_raw)
+@app.on_callback_query(filters.regex(r"^(toggle|selpage|selected|done):"))
+async def admin_selection_callback_handler(_: Client, query: CallbackQuery) -> None:
+    if not await require_admin_callback(query):
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0]
+
+    try:
+        match_id = int(parts[1])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка данных кнопки.", show_alert=True)
+        return
 
     match = db.execute(
         "SELECT * FROM matches WHERE id = ? AND status = 'open'",
@@ -909,41 +1237,78 @@ async def callback_handler(_: Client, query: CallbackQuery) -> None:
         await query.answer("Матч уже закрыт или не найден.", show_alert=True)
         return
 
-    user_id = query.from_user.id
-    player = get_player(user_id)
+    if action == "toggle":
+        try:
+            page = int(parts[2])
+            player_id = int(parts[3])
+        except (IndexError, ValueError):
+            await query.answer("Ошибка данных игрока.", show_alert=True)
+            return
 
-    if action == "list":
-        await query.message.reply_text(format_players_list(match_id))
+        selected_ids = get_selected_player_ids(match_id)
+        player = get_player(player_id)
+        if not player:
+            await query.answer("Профиль игрока не найден.", show_alert=True)
+            return
+
+        if player_id in selected_ids:
+            remove_match_player(match_id, player_id)
+            await query.answer(f"➖ Убрал: {player.name}")
+        else:
+            set_match_player(match_id, player_id, "playing")
+            await query.answer(f"✅ Добавил: {player.name}")
+
+        try:
+            await query.message.edit_text(
+                selection_text(match_id, page=page),
+                reply_markup=selection_keyboard(match_id, page=page),
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "selpage":
+        try:
+            page = int(parts[2])
+        except (IndexError, ValueError):
+            page = 0
+
+        try:
+            await query.message.edit_text(
+                selection_text(match_id, page=page),
+                reply_markup=selection_keyboard(match_id, page=page),
+            )
+        except Exception:
+            pass
         await query.answer()
         return
 
-    if not player:
-        await query.answer(
-            "Сначала создай профиль в личке бота: /new_profile",
-            show_alert=True,
-        )
+    if action == "selected":
+        try:
+            page = int(parts[2])
+        except (IndexError, ValueError):
+            page = 0
+
+        await query.message.reply_text(format_players_list(match_id))
+        await query.answer()
+        try:
+            await query.message.edit_text(
+                selection_text(match_id, page=page),
+                reply_markup=selection_keyboard(match_id, page=page),
+            )
+        except Exception:
+            pass
         return
 
-    if action == "join":
-        set_match_player(match_id, user_id, "playing")
-        await query.answer("✅ Ты записан на игру!")
-    elif action == "leave":
-        set_match_player(match_id, user_id, "not_playing")
-        await query.answer("❌ Отметил, что ты не играешь.")
-
-    playing_count = len(get_match_players(match_id, "playing"))
-    try:
-        await query.message.edit_text(
-            f"⚽ **Игра сегодня / ближайшая среда**\n\n"
-            f"Матч #{match_id}\n"
-            f"✅ Сейчас играют: **{playing_count}**\n\n"
-            "Кто играет? Нажмите кнопку ниже.\n\n"
-            "Перед записью игрок должен создать профиль в личке бота: /new_profile",
-            reply_markup=match_keyboard(match_id),
+    if action == "done":
+        selected_count = len(get_match_players(match_id, "playing"))
+        await query.message.reply_text(
+            f"✅ Список игроков на матч #{match_id} сохранен.\n"
+            f"Выбрано игроков: **{selected_count}**\n\n"
+            "Теперь админ может написать /balance"
         )
-    except Exception:
-        # Не критично: Telegram может не дать редактировать слишком старое сообщение.
-        pass
+        await query.answer("Готово")
+        return
 
 
 if __name__ == "__main__":
