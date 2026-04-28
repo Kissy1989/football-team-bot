@@ -78,7 +78,27 @@ PROFILE_STEPS = [
 # Простой FSM в памяти. После перезапуска недозаполненные анкеты сбросятся.
 profile_sessions: dict[int, dict[str, Any]] = {}
 
+# Сессии админа: создание чужого игрока и редактирование характеристик.
+admin_sessions: dict[int, dict[str, Any]] = {}
+
 PLAYERS_PER_PAGE = 20
+
+EDITABLE_FIELDS: list[tuple[str, str]] = [
+    ("name", "👤 Имя"),
+    ("main_position", "🎯 Основная позиция"),
+    ("second_position", "🔁 Доп. позиция"),
+    ("speed", "⚡ Скорость"),
+    ("dribbling", "🎩 Дриблинг"),
+    ("passing", "🎯 Пас"),
+    ("shooting", "🥅 Атака/удар"),
+    ("defense", "🛡 Защита"),
+    ("stamina", "🔋 Выносливость"),
+    ("physical", "💪 Физика"),
+    ("goalkeeper_skill", "🧤 Вратарский навык"),
+    ("goalkeeper_willingness", "🚪 Готовность в ворота"),
+]
+
+EDITABLE_FIELD_NAMES = {field for field, _label in EDITABLE_FIELDS}
 
 
 @dataclass
@@ -149,7 +169,18 @@ def init_db() -> None:
         ON match_players(match_id, status);
         """
     )
+
+    ensure_column("matches", "team_count", "INTEGER DEFAULT 2")
+    ensure_column("matches", "players_per_team", "INTEGER DEFAULT 0")
     db.commit()
+
+
+def ensure_column(table: str, column: str, definition: str) -> None:
+    """Добавляет колонку в SQLite, если бот обновляется со старой версии."""
+    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+    existing = {row["name"] for row in rows}
+    if column not in existing:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def now_iso() -> str:
@@ -225,6 +256,38 @@ def parse_willingness(value: str) -> int:
     if raw not in mapping:
         raise ValueError("Напиши число от 0 до 4")
     return mapping[raw]
+
+
+def parse_profile_value(field: str, raw_value: str) -> Any:
+    """Проверяет и преобразует значение анкеты/редактирования."""
+    if field == "name":
+        value = raw_value.strip()
+        if len(value) < 2:
+            raise ValueError("Имя слишком короткое.")
+        if len(value) > 40:
+            raise ValueError("Имя слишком длинное. Максимум 40 символов.")
+        return value
+
+    if field in {"main_position", "second_position"}:
+        return normalize_position(raw_value, allow_none=(field == "second_position"))
+
+    if field == "goalkeeper_willingness":
+        return parse_willingness(raw_value)
+
+    if field in {
+        "speed", "dribbling", "passing", "shooting", "defense",
+        "stamina", "physical", "goalkeeper_skill",
+    }:
+        return clamp_rating(raw_value)
+
+    raise ValueError("Неизвестное поле профиля.")
+
+
+def editable_field_label(field: str) -> str:
+    for item_field, label in EDITABLE_FIELDS:
+        if item_field == field:
+            return label
+    return field
 
 
 def willingness_text(value: int) -> str:
@@ -327,6 +390,61 @@ def save_player(user_id: int, username: Optional[str], data: dict[str, Any]) -> 
         ),
     )
     db.commit()
+
+
+def next_fake_player_id() -> int:
+    """ID для игрока, созданного админом без Telegram-аккаунта."""
+    row = db.execute(
+        "SELECT MIN(telegram_id) AS min_id FROM players WHERE telegram_id < 0"
+    ).fetchone()
+    min_id = row["min_id"] if row else None
+    return int(min_id) - 1 if min_id is not None else -1
+
+
+def player_to_data(player: "Player") -> dict[str, Any]:
+    return {
+        "name": player.name,
+        "main_position": player.main_position,
+        "second_position": player.second_position,
+        "speed": player.speed,
+        "dribbling": player.dribbling,
+        "passing": player.passing,
+        "shooting": player.shooting,
+        "defense": player.defense,
+        "stamina": player.stamina,
+        "physical": player.physical,
+        "goalkeeper_skill": player.goalkeeper_skill,
+        "goalkeeper_willingness": player.goalkeeper_willingness,
+    }
+
+
+def update_player_field(player_id: int, field: str, value: Any) -> "Player":
+    if field not in EDITABLE_FIELD_NAMES:
+        raise ValueError("Это поле нельзя менять.")
+
+    player = get_player(player_id)
+    if not player:
+        raise ValueError("Игрок не найден.")
+
+    data = player_to_data(player)
+    data[field] = value
+    overall = calculate_overall(data)
+    timestamp = now_iso()
+
+    db.execute(
+        f"""
+        UPDATE players
+        SET {field} = ?, overall_rating = ?, updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (value, overall, timestamp, player_id),
+    )
+    db.commit()
+
+    updated = get_player(player_id)
+    if not updated:
+        raise ValueError("Не удалось обновить игрока.")
+    return updated
 
 
 def row_to_player(row: sqlite3.Row) -> Player:
@@ -448,20 +566,79 @@ def get_open_match(chat_id: int) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
-def create_match(chat_id: int, created_by: int) -> tuple[int, bool]:
+def get_match_by_id(match_id: int) -> Optional[sqlite3.Row]:
+    return db.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
+
+
+def get_match_format(match: sqlite3.Row) -> tuple[int, int]:
+    keys = set(match.keys())
+    team_count = int(match["team_count"] or 2) if "team_count" in keys else 2
+    players_per_team = int(match["players_per_team"] or 0) if "players_per_team" in keys else 0
+    return max(2, team_count), max(0, players_per_team)
+
+
+def set_match_format(match_id: int, team_count: int, players_per_team: int) -> None:
+    db.execute(
+        "UPDATE matches SET team_count = ?, players_per_team = ? WHERE id = ?",
+        (team_count, players_per_team, match_id),
+    )
+    db.commit()
+
+
+def create_match(
+    chat_id: int,
+    created_by: int,
+    team_count: int = 2,
+    players_per_team: int = 0,
+) -> tuple[int, bool]:
     active = get_open_match(chat_id)
     if active:
         return int(active["id"]), False
 
     cursor = db.execute(
         """
-        INSERT INTO matches (chat_id, created_by, match_date, status, created_at)
-        VALUES (?, ?, ?, 'open', ?)
+        INSERT INTO matches (
+            chat_id, created_by, match_date, status, created_at,
+            team_count, players_per_team
+        )
+        VALUES (?, ?, ?, 'open', ?, ?, ?)
         """,
-        (chat_id, created_by, today_str(), now_iso()),
+        (chat_id, created_by, today_str(), now_iso(), team_count, players_per_team),
     )
     db.commit()
     return int(cursor.lastrowid), True
+
+
+def parse_team_format_from_text(text: str, default_teams: int = 2, default_players: int = 0) -> tuple[int, int, bool]:
+    """Возвращает: количество команд, игроков в команде, был ли формат указан."""
+    parts = (text or "").split()
+    if len(parts) == 1:
+        return default_teams, default_players, False
+
+    if len(parts) not in {2, 3}:
+        raise ValueError("Формат команды: `/create_match 2 7` или `/teams 3 5`")
+
+    try:
+        team_count = int(parts[1])
+        players_per_team = int(parts[2]) if len(parts) == 3 else default_players
+    except ValueError as exc:
+        raise ValueError("Количество команд и игроков должно быть числом.") from exc
+
+    if team_count < 2 or team_count > 6:
+        raise ValueError("Количество команд должно быть от 2 до 6.")
+
+    if players_per_team < 0 or players_per_team > 20:
+        raise ValueError("Игроков в команде должно быть от 1 до 20. Или 0 для авто.")
+
+    return team_count, players_per_team, True
+
+
+def format_match_format(match: sqlite3.Row) -> str:
+    team_count, players_per_team = get_match_format(match)
+    if players_per_team:
+        total_needed = team_count * players_per_team
+        return f"{team_count} команд × {players_per_team} игроков = нужно {total_needed}"
+    return f"{team_count} команд, количество игроков авто"
 
 
 def set_match_player(match_id: int, player_id: int, status: str = "playing") -> None:
@@ -551,7 +728,7 @@ def selection_keyboard(match_id: int, page: int = 0) -> InlineKeyboardMarkup:
         mark = "✅" if player.telegram_id in selected_ids else "➕"
         text = (
             f"{mark} {short_name(player)} "
-            f"{player.main_position} ⭐{player.overall_rating} 🧤{player.goalkeeper_skill}"
+            f"{player.main_position} ⭐{player.overall_rating}"
         )
         buttons.append([
             InlineKeyboardButton(
@@ -581,14 +758,28 @@ def selection_text(match_id: int, page: int = 0) -> str:
     selected_count = len(get_match_players(match_id, "playing"))
     total_pages = max(1, (total_players + PLAYERS_PER_PAGE - 1) // PLAYERS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
+    match = get_match_by_id(match_id)
+
+    format_line = ""
+    if match:
+        team_count, players_per_team = get_match_format(match)
+        if players_per_team:
+            need = team_count * players_per_team
+            format_line = (
+                f"Формат: **{team_count}×{players_per_team}** — нужно игроков: **{need}**\n"
+            )
+        else:
+            format_line = f"Формат: **{team_count} команд**, игроков в команде авто\n"
 
     return (
         f"👥 **Выбор игроков на матч #{match_id}**\n\n"
+        f"{format_line}"
         f"Всего профилей в боте: **{total_players}**\n"
         f"Админ выбрал на игру: **{selected_count}**\n"
         f"Страница: **{page + 1}/{total_pages}**\n\n"
         "Нажимайте на игроков: ✅ выбран, ➕ не выбран.\n"
-        "Обычные игроки сами записаться не могут."
+        "Обычные игроки сами записаться не могут.\n\n"
+        "Формат можно изменить командой: `/teams 2 7`"
     )
 
 
@@ -602,8 +793,7 @@ def format_players_list(match_id: int) -> str:
         for index, player in enumerate(playing, 1):
             username = f" @{player.username}" if player.username else ""
             lines.append(
-                f"{index}. {player.name}{username} — {position_text(player.main_position)} — "
-                f"⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
+                f"{index}. {player.name}{username} — {position_text(player.main_position)} — ⭐ {player.overall_rating}"
             )
     else:
         lines.append("Пока никого не выбрали. Админ может написать /select_players")
@@ -625,6 +815,66 @@ def format_all_profiles() -> str:
             f"⭐ {player.overall_rating} | 🧤 {player.goalkeeper_skill}"
         )
     return "\n".join(lines)
+
+
+def edit_players_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    players = get_all_players()
+    total_pages = max(1, (len(players) + PLAYERS_PER_PAGE - 1) // PLAYERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PLAYERS_PER_PAGE
+    current_players = players[start:start + PLAYERS_PER_PAGE]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for player in current_players:
+        buttons.append([
+            InlineKeyboardButton(
+                f"✏️ {short_name(player)} — {player.main_position} ⭐{player.overall_rating}",
+                callback_data=f"editpick:{player.telegram_id}:{page}",
+            )
+        ])
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"editpage:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"editpage:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def edit_players_text(page: int = 0) -> str:
+    players_count = get_players_count()
+    total_pages = max(1, (players_count + PLAYERS_PER_PAGE - 1) // PLAYERS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    return (
+        "✏️ **Редактирование игроков**\n\n"
+        f"Всего профилей: **{players_count}**\n"
+        f"Страница: **{page + 1}/{total_pages}**\n\n"
+        "Выберите игрока, потом выберите характеристику."
+    )
+
+
+def edit_fields_keyboard(player_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for field, label in EDITABLE_FIELDS:
+        buttons.append([
+            InlineKeyboardButton(label, callback_data=f"editfield:{player_id}:{field}")
+        ])
+
+    buttons.append([
+        InlineKeyboardButton("⬅️ К списку игроков", callback_data=f"editpage:{page}")
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def edit_player_text(player: Player) -> str:
+    return (
+        f"✏️ **Изменить игрока**\n\n"
+        f"{format_player_profile(player)}\n\n"
+        "Выберите, что изменить:"
+    )
 
 
 def find_players_by_query(query: str) -> list[Player]:
@@ -745,9 +995,23 @@ def assignment_penalty(team: list[Player], candidate: Player, max_size: int) -> 
     return penalty
 
 
-def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Player], list[Player]]:
-    if len(players) < 2:
-        return players, []
+def target_team_sizes(total_players: int, team_count: int, players_per_team: int = 0) -> list[int]:
+    if players_per_team > 0:
+        return [players_per_team for _ in range(team_count)]
+
+    base = total_players // team_count
+    extra = total_players % team_count
+    return [base + (1 if index < extra else 0) for index in range(team_count)]
+
+
+def balance_n_teams(
+    players: list[Player],
+    team_count: int = 2,
+    players_per_team: int = 0,
+    shuffle: bool = False,
+) -> list[list[Player]]:
+    if team_count < 2:
+        team_count = 2
 
     rng = random.Random()
     if not shuffle:
@@ -756,13 +1020,10 @@ def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Pl
     players = players[:]
     rng.shuffle(players)
 
-    team_a: list[Player] = []
-    team_b: list[Player] = []
+    targets = target_team_sizes(len(players), team_count, players_per_team)
+    teams: list[list[Player]] = [[] for _ in range(team_count)]
 
-    max_a = (len(players) + 1) // 2
-    max_b = len(players) // 2
-
-    # 1) Сначала выбираем вратарей или запасных вратарей.
+    # 1) Сначала разводим вратарей/запасных вратарей по разным командам.
     gk_candidates = [
         p for p in players
         if p.goalkeeper_willingness > 0 or p.main_position == "GK" or p.second_position == "GK"
@@ -771,17 +1032,15 @@ def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Pl
 
     selected_gks: list[Player] = []
     for candidate in gk_candidates:
-        if len(selected_gks) == 2:
+        if len(selected_gks) >= team_count:
             break
         if candidate.goalkeeper_willingness == 0 and candidate.main_position != "GK":
             continue
         selected_gks.append(candidate)
 
-    # Если есть 2 подходящих — разводим по разным командам.
-    if selected_gks:
-        team_a.append(selected_gks[0])
-    if len(selected_gks) > 1:
-        team_b.append(selected_gks[1])
+    for team_index, goalkeeper in enumerate(selected_gks):
+        if team_index < len(teams) and len(teams[team_index]) < targets[team_index]:
+            teams[team_index].append(goalkeeper)
 
     remaining = [p for p in players if p not in selected_gks]
 
@@ -796,100 +1055,112 @@ def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Pl
     )
 
     for player in remaining:
-        penalty_a = assignment_penalty(team_a, player, max_a)
-        penalty_b = assignment_penalty(team_b, player, max_b)
+        best_team_index = None
+        best_penalty = None
 
-        # Добавляем поправку: команда с меньшей суммой рейтинга получает преимущество.
-        total_a = team_metrics(team_a)["total"]
-        total_b = team_metrics(team_b)["total"]
-        penalty_a += max(0, total_a - total_b) * 0.8
-        penalty_b += max(0, total_b - total_a) * 0.8
+        totals = [team_metrics(team)["total"] for team in teams]
+        min_total = min(totals) if totals else 0
 
-        if penalty_a <= penalty_b:
-            team_a.append(player)
+        for index, team in enumerate(teams):
+            if len(team) >= targets[index]:
+                continue
+
+            penalty = assignment_penalty(team, player, targets[index])
+            penalty += max(0, totals[index] - min_total) * 0.8
+            penalty += len(team) * 2.0
+
+            if best_penalty is None or penalty < best_penalty:
+                best_penalty = penalty
+                best_team_index = index
+
+        if best_team_index is None:
+            teams[-1].append(player)
         else:
-            team_b.append(player)
+            teams[best_team_index].append(player)
 
-    # 3) Если получилось заметно неравно по силе, пробуем пару простых обменов.
-    for _ in range(20):
-        total_a = team_metrics(team_a)["total"]
-        total_b = team_metrics(team_b)["total"]
-        diff = abs(total_a - total_b)
+    # 3) Пара простых обменов между самой сильной и самой слабой командой.
+    for _ in range(40):
+        totals = [team_metrics(team)["total"] for team in teams]
+        strongest_index = max(range(len(teams)), key=lambda i: totals[i])
+        weakest_index = min(range(len(teams)), key=lambda i: totals[i])
+        current_diff = totals[strongest_index] - totals[weakest_index]
 
-        if diff <= 5:
+        if current_diff <= 5:
             break
 
-        stronger = team_a if total_a > total_b else team_b
-        weaker = team_b if total_a > total_b else team_a
-
+        strongest = teams[strongest_index]
+        weakest = teams[weakest_index]
         best_swap = None
-        best_diff = diff
+        best_diff = current_diff
 
-        for a_player in stronger:
-            for b_player in weaker:
-                # Не меняем выбранных вратарей, чтобы не потерять баланс ворот.
-                if a_player in selected_gks or b_player in selected_gks:
+        for strong_player in strongest:
+            for weak_player in weakest:
+                if strong_player in selected_gks or weak_player in selected_gks:
                     continue
 
-                new_stronger_total = (
-                    total_a - a_player.overall_rating + b_player.overall_rating
-                    if stronger is team_a
-                    else total_b - a_player.overall_rating + b_player.overall_rating
+                new_totals = totals[:]
+                new_totals[strongest_index] = (
+                    new_totals[strongest_index]
+                    - strong_player.overall_rating
+                    + weak_player.overall_rating
                 )
-                new_weaker_total = (
-                    total_b - b_player.overall_rating + a_player.overall_rating
-                    if weaker is team_b
-                    else total_a - b_player.overall_rating + a_player.overall_rating
+                new_totals[weakest_index] = (
+                    new_totals[weakest_index]
+                    - weak_player.overall_rating
+                    + strong_player.overall_rating
                 )
-                new_diff = abs(new_stronger_total - new_weaker_total)
+                new_diff = max(new_totals) - min(new_totals)
 
                 if new_diff < best_diff:
                     best_diff = new_diff
-                    best_swap = (a_player, b_player)
+                    best_swap = (strong_player, weak_player)
 
         if not best_swap:
             break
 
-        a_player, b_player = best_swap
-        stronger.remove(a_player)
-        stronger.append(b_player)
-        weaker.remove(b_player)
-        weaker.append(a_player)
+        strong_player, weak_player = best_swap
+        strongest.remove(strong_player)
+        strongest.append(weak_player)
+        weakest.remove(weak_player)
+        weakest.append(strong_player)
 
-    return team_a, team_b
+    return teams
+
+
+def balance_teams(players: list[Player], shuffle: bool = False) -> tuple[list[Player], list[Player]]:
+    teams = balance_n_teams(players, team_count=2, players_per_team=0, shuffle=shuffle)
+    return teams[0], teams[1]
+
+
+TEAM_NAMES = [
+    "🔴 Команда A",
+    "🔵 Команда B",
+    "🟢 Команда C",
+    "🟡 Команда D",
+    "🟣 Команда E",
+    "⚫ Команда F",
+]
 
 
 def format_team(name: str, team: list[Player]) -> str:
-    metrics = team_metrics(team)
     lines = [f"**{name}**"]
     for index, player in enumerate(team, 1):
-        gk_mark = " 🧤" if player.main_position == "GK" or player.second_position == "GK" or player.goalkeeper_skill >= 60 else ""
         lines.append(
-            f"{index}. {player.name}{gk_mark} — {position_text(player.main_position)} — "
-            f"⭐ {player.overall_rating} — 🧤 {player.goalkeeper_skill}"
+            f"{index}. {player.name} — {position_text(player.main_position)} — ⭐ {player.overall_rating}"
         )
-
-    lines.append(
-        "\n"
-        f"Средний рейтинг: **{metrics['overall']}**\n"
-        f"Атака: **{metrics['attack']}** | Защита: **{metrics['defense']}** | "
-        f"Скорость: **{metrics['speed']}** | Ворота: **{metrics['gk']}**"
-    )
     return "\n".join(lines)
 
 
-def format_balanced_teams(team_a: list[Player], team_b: list[Player]) -> str:
-    metrics_a = team_metrics(team_a)
-    metrics_b = team_metrics(team_b)
-    diff = abs(metrics_a["total"] - metrics_b["total"])
+def format_balanced_teams_n(teams: list[list[Player]]) -> str:
+    parts = ["⚽ **Деление команд**"]
+    for index, team in enumerate(teams):
+        name = TEAM_NAMES[index] if index < len(TEAM_NAMES) else f"Команда {index + 1}"
+        parts.append(format_team(name, team))
+    return "\n\n".join(parts)
 
-    return (
-        "⚽ **Автоматическое деление команд**\n\n"
-        f"{format_team('🔴 Команда A', team_a)}\n\n"
-        f"{format_team('🔵 Команда B', team_b)}\n\n"
-        f"📊 Разница общей силы: **{diff}**\n"
-        "🧤 Ворота учтены: бот сначала разводит основных/запасных вратарей по разным командам."
-    )
+
+def format_balanced_teams(team_a: list[Player], team_b: list[Player]) -> str:
+    return format_balanced_teams_n([team_a, team_b])
 
 
 @app.on_message(filters.command("start"))
@@ -900,6 +1171,9 @@ async def start_handler(_: Client, message: Message) -> None:
             "Игроки могут только создать или обновить профиль:\n"
             "/new_profile — создать или обновить FIFA-профиль\n"
             "/profile — посмотреть свой профиль\n\n"
+            "Админ может создавать/редактировать игроков:\n"
+            "/admin_new_player — создать игрока вручную\n"
+            "/edit_player — изменить характеристики игрока\n\n"
             "Матч и список игроков выбирает только админ в группе."
         )
     else:
@@ -926,7 +1200,8 @@ async def new_profile_handler(_: Client, message: Message) -> None:
 async def cancel_handler(_: Client, message: Message) -> None:
     user_id = message.from_user.id
     profile_sessions.pop(user_id, None)
-    await message.reply_text("Ок, анкету отменил.")
+    admin_sessions.pop(user_id, None)
+    await message.reply_text("Ок, действие отменил.")
 
 
 @app.on_message(filters.private & filters.command("profile"))
@@ -939,29 +1214,155 @@ async def profile_handler(_: Client, message: Message) -> None:
     await message.reply_text(format_player_profile(player))
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "new_profile", "cancel", "profile"]))
+@app.on_message(filters.private & filters.command(["admin_new_player", "new_player"]))
+async def admin_new_player_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    user_id = message.from_user.id
+    profile_sessions.pop(user_id, None)
+    admin_sessions[user_id] = {"mode": "admin_create_player", "step": 0, "data": {}}
+
+    await message.reply_text(
+        "➕ **Создание игрока админом**\n\n"
+        "Этот игрок будет создан без Telegram-аккаунта. "
+        "Потом админ сможет выбрать его на матч как обычного игрока.\n\n"
+        "Можно отменить командой /cancel.\n\n"
+        + PROFILE_STEPS[0][1]
+    )
+
+
+@app.on_message(filters.command(["edit_player", "edit_players"]))
+async def edit_player_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    if get_players_count() == 0:
+        await message.reply_text("Пока нет профилей игроков.")
+        return
+
+    await message.reply_text(
+        edit_players_text(page=0),
+        reply_markup=edit_players_keyboard(page=0),
+    )
+
+
+@app.on_message(filters.command("set_player"))
+async def set_player_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 4:
+        await message.reply_text(
+            "Быстрое изменение через команду:\n"
+            "`/set_player ID поле значение`\n\n"
+            "Пример:\n"
+            "`/set_player -1 speed 75`\n"
+            "`/set_player 123456789 shooting 80`\n\n"
+            "Проще использовать кнопки: /edit_player"
+        )
+        return
+
+    try:
+        player_id = int(parts[1])
+    except ValueError:
+        await message.reply_text("ID игрока должен быть числом. Посмотреть ID: /profiles")
+        return
+
+    field = parts[2].strip()
+    raw_value = parts[3].strip()
+
+    if field not in EDITABLE_FIELD_NAMES:
+        await message.reply_text(
+            "Такого поля нет. Доступные поля:\n"
+            + ", ".join(field for field, _label in EDITABLE_FIELDS)
+        )
+        return
+
+    try:
+        value = parse_profile_value(field, raw_value)
+        player = update_player_field(player_id, field, value)
+    except ValueError as exc:
+        await message.reply_text(f"❌ {exc}")
+        return
+
+    await message.reply_text("✅ Игрок обновлен:\n\n" + format_player_profile(player))
+
+
+@app.on_message(filters.private & filters.text & ~filters.command([
+    "start", "new_profile", "admin_new_player", "new_player", "edit_player",
+    "edit_players", "set_player", "cancel", "profile"
+]))
 async def profile_text_handler(_: Client, message: Message) -> None:
     user_id = message.from_user.id
+    raw_value = message.text or ""
+
+    admin_session = admin_sessions.get(user_id)
+    if admin_session:
+        mode = admin_session.get("mode")
+
+        if mode == "admin_create_player":
+            step_index = admin_session["step"]
+            field, _question = PROFILE_STEPS[step_index]
+
+            try:
+                value = parse_profile_value(field, raw_value)
+            except ValueError as exc:
+                await message.reply_text(f"❌ {exc}\n\nПопробуй еще раз.")
+                return
+
+            admin_session["data"][field] = value
+            admin_session["step"] += 1
+
+            if admin_session["step"] >= len(PROFILE_STEPS):
+                fake_id = next_fake_player_id()
+                save_player(
+                    user_id=fake_id,
+                    username=None,
+                    data=admin_session["data"],
+                )
+                admin_sessions.pop(user_id, None)
+                player = get_player(fake_id)
+                await message.reply_text(
+                    "✅ Игрок создан админом!\n\n" + format_player_profile(player)
+                )
+                return
+
+            _next_field, next_question = PROFILE_STEPS[admin_session["step"]]
+            await message.reply_text(next_question)
+            return
+
+        if mode == "edit_field":
+            player_id = int(admin_session["player_id"])
+            field = str(admin_session["field"])
+
+            try:
+                value = parse_profile_value(field, raw_value)
+                player = update_player_field(player_id, field, value)
+            except ValueError as exc:
+                await message.reply_text(f"❌ {exc}\n\nПопробуй еще раз или /cancel")
+                return
+
+            admin_sessions.pop(user_id, None)
+            await message.reply_text(
+                f"✅ Изменено: **{editable_field_label(field)}**\n\n"
+                + format_player_profile(player)
+            )
+            return
+
     session = profile_sessions.get(user_id)
     if not session:
+        if raw_value.startswith("/"):
+            return
         await message.reply_text("Чтобы создать профиль, напиши /new_profile")
         return
 
     step_index = session["step"]
     field, _question = PROFILE_STEPS[step_index]
-    raw_value = message.text or ""
 
     try:
-        if field == "name":
-            value = raw_value.strip()
-            if len(value) < 2:
-                raise ValueError("Имя слишком короткое.")
-        elif field in {"main_position", "second_position"}:
-            value = normalize_position(raw_value, allow_none=(field == "second_position"))
-        elif field == "goalkeeper_willingness":
-            value = parse_willingness(raw_value)
-        else:
-            value = clamp_rating(raw_value)
+        value = parse_profile_value(field, raw_value)
     except ValueError as exc:
         await message.reply_text(f"❌ {exc}\n\nПопробуй еще раз.")
         return
@@ -998,18 +1399,77 @@ async def create_match_handler(_: Client, message: Message) -> None:
     if not await require_admin(message):
         return
 
-    match_id, created = create_match(message.chat.id, message.from_user.id)
+    try:
+        team_count, players_per_team, format_was_set = parse_team_format_from_text(
+            message.text or "", default_teams=2, default_players=0
+        )
+    except ValueError as exc:
+        await message.reply_text(f"❌ {exc}\n\nПример: `/create_match 2 7` или `/create_match 3 5`")
+        return
+
+    match_id, created = create_match(
+        message.chat.id,
+        message.from_user.id,
+        team_count=team_count,
+        players_per_team=players_per_team,
+    )
+
+    if not created and format_was_set:
+        set_match_format(match_id, team_count, players_per_team)
+
+    match = get_match_by_id(match_id)
     if created:
         header = f"⚽ **Матч #{match_id} создан**"
     else:
         header = f"⚽ **Уже есть открытый матч #{match_id}**"
 
     await message.reply_text(
-        f"{header}\n\n"
+        f"{header}\n"
+        f"Формат: **{format_match_format(match)}**\n\n"
         "Игроки сами не записываются.\n"
         "Только админ выбирает список игроков из готовых профилей.\n\n"
-        "Нажимайте на игроков ниже или используйте команду /select_players.",
+        "Нажимайте на игроков ниже или используйте команду /select_players.\n"
+        "Изменить формат: `/teams 2 7` или `/teams 3 5`",
         reply_markup=selection_keyboard(match_id, page=0),
+    )
+
+
+@app.on_message(filters.group & filters.command(["teams", "match_format"]))
+async def teams_format_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    try:
+        team_count, players_per_team, was_set = parse_team_format_from_text(
+            message.text or "", default_teams=2, default_players=0
+        )
+    except ValueError as exc:
+        await message.reply_text(
+            f"❌ {exc}\n\n"
+            "Примеры:\n"
+            "`/teams 2 7` — 2 команды по 7\n"
+            "`/teams 3 5` — 3 команды по 5"
+        )
+        return
+
+    if not was_set:
+        await message.reply_text(
+            "Напишите формат так:\n"
+            "`/teams 2 7` — 2 команды по 7\n"
+            "`/teams 3 5` — 3 команды по 5"
+        )
+        return
+
+    set_match_format(int(active["id"]), team_count, players_per_team)
+    active = get_match_by_id(int(active["id"]))
+    await message.reply_text(
+        f"✅ Формат матча изменен: **{format_match_format(active)}**\n\n"
+        "Теперь выберите нужное количество игроков через /select_players."
     )
 
 
@@ -1157,6 +1617,24 @@ async def clear_players_handler(_: Client, message: Message) -> None:
     await message.reply_text("🧹 Список игроков на текущий матч очищен.")
 
 
+def validate_balance_request(match: sqlite3.Row, players_count: int) -> Optional[str]:
+    team_count, players_per_team = get_match_format(match)
+
+    if players_count < team_count:
+        return f"Нужно минимум {team_count} игроков, чтобы сделать {team_count} команд."
+
+    if players_per_team > 0:
+        need = team_count * players_per_team
+        if players_count != need:
+            return (
+                f"Для формата **{team_count}×{players_per_team}** нужно игроков: **{need}**.\n"
+                f"Сейчас выбрано: **{players_count}**.\n\n"
+                "Добавьте/уберите игроков через /select_players или измените формат, например `/teams 2 7`."
+            )
+
+    return None
+
+
 @app.on_message(filters.group & filters.command("balance"))
 async def balance_handler(_: Client, message: Message) -> None:
     if not await require_admin(message):
@@ -1168,12 +1646,14 @@ async def balance_handler(_: Client, message: Message) -> None:
         return
 
     players = get_match_players(active["id"], "playing")
-    if len(players) < 4:
-        await message.reply_text("Нужно хотя бы 4 игрока, чтобы нормально поделить команды.")
+    error = validate_balance_request(active, len(players))
+    if error:
+        await message.reply_text("❌ " + error)
         return
 
-    team_a, team_b = balance_teams(players, shuffle=False)
-    await message.reply_text(format_balanced_teams(team_a, team_b))
+    team_count, players_per_team = get_match_format(active)
+    teams = balance_n_teams(players, team_count=team_count, players_per_team=players_per_team, shuffle=False)
+    await message.reply_text(format_balanced_teams_n(teams))
 
 
 @app.on_message(filters.group & filters.command("shuffle"))
@@ -1187,12 +1667,14 @@ async def shuffle_handler(_: Client, message: Message) -> None:
         return
 
     players = get_match_players(active["id"], "playing")
-    if len(players) < 4:
-        await message.reply_text("Нужно хотя бы 4 игрока, чтобы нормально поделить команды.")
+    error = validate_balance_request(active, len(players))
+    if error:
+        await message.reply_text("❌ " + error)
         return
 
-    team_a, team_b = balance_teams(players, shuffle=True)
-    await message.reply_text("🔄 Новый вариант:\n\n" + format_balanced_teams(team_a, team_b))
+    team_count, players_per_team = get_match_format(active)
+    teams = balance_n_teams(players, team_count=team_count, players_per_team=players_per_team, shuffle=True)
+    await message.reply_text("🔄 Новый вариант:\n\n" + format_balanced_teams_n(teams))
 
 
 @app.on_message(filters.group & filters.command("reset_match"))
@@ -1211,6 +1693,89 @@ async def reset_match_handler(_: Client, message: Message) -> None:
     )
     db.commit()
     await message.reply_text("♻️ Текущий матч сброшен. Можно создать новый через /create_match")
+
+
+@app.on_callback_query(filters.regex(r"^(editpage|editpick|editfield):"))
+async def admin_edit_callback_handler(_: Client, query: CallbackQuery) -> None:
+    if not await require_admin_callback(query):
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0]
+
+    if action == "editpage":
+        try:
+            page = int(parts[1])
+        except (IndexError, ValueError):
+            page = 0
+
+        try:
+            await query.message.edit_text(
+                edit_players_text(page=page),
+                reply_markup=edit_players_keyboard(page=page),
+            )
+        except Exception:
+            pass
+        await query.answer()
+        return
+
+    if action == "editpick":
+        try:
+            player_id = int(parts[1])
+            page = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("Ошибка данных игрока.", show_alert=True)
+            return
+
+        player = get_player(player_id)
+        if not player:
+            await query.answer("Игрок не найден.", show_alert=True)
+            return
+
+        try:
+            await query.message.edit_text(
+                edit_player_text(player),
+                reply_markup=edit_fields_keyboard(player_id, page=page),
+            )
+        except Exception:
+            pass
+        await query.answer()
+        return
+
+    if action == "editfield":
+        try:
+            player_id = int(parts[1])
+            field = parts[2]
+        except (IndexError, ValueError):
+            await query.answer("Ошибка данных поля.", show_alert=True)
+            return
+
+        if field not in EDITABLE_FIELD_NAMES:
+            await query.answer("Это поле нельзя менять.", show_alert=True)
+            return
+
+        player = get_player(player_id)
+        if not player:
+            await query.answer("Игрок не найден.", show_alert=True)
+            return
+
+        admin_sessions[query.from_user.id] = {
+            "mode": "edit_field",
+            "player_id": player_id,
+            "field": field,
+        }
+
+        current_value = getattr(player, field)
+        await query.message.reply_text(
+            f"✏️ Меняем: **{editable_field_label(field)}**\n"
+            f"Игрок: **{player.name}**\n"
+            f"Сейчас: `{current_value}`\n\n"
+            "Отправьте новое значение одним сообщением.\n"
+            "Отмена: /cancel"
+        )
+        await query.answer("Жду новое значение")
+        return
 
 
 @app.on_callback_query(filters.regex(r"^(toggle|selpage|selected|done):"))
@@ -1302,8 +1867,11 @@ async def admin_selection_callback_handler(_: Client, query: CallbackQuery) -> N
 
     if action == "done":
         selected_count = len(get_match_players(match_id, "playing"))
+        match = get_match_by_id(match_id)
+        format_line = f"Формат: **{format_match_format(match)}**\n" if match else ""
         await query.message.reply_text(
             f"✅ Список игроков на матч #{match_id} сохранен.\n"
+            f"{format_line}"
             f"Выбрано игроков: **{selected_count}**\n\n"
             "Теперь админ может написать /balance"
         )
