@@ -167,6 +167,20 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_match_players_status
         ON match_players(match_id, status);
+
+        CREATE TABLE IF NOT EXISTS match_team_players (
+            match_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            team_index INTEGER NOT NULL,
+            position_in_team INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (match_id, player_id),
+            FOREIGN KEY (match_id) REFERENCES matches(id),
+            FOREIGN KEY (player_id) REFERENCES players(telegram_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_match_team_players_match
+        ON match_team_players(match_id, team_index, position_in_team);
         """
     )
 
@@ -654,6 +668,10 @@ def set_match_player(match_id: int, player_id: int, status: str = "playing") -> 
     )
     db.commit()
 
+    # Если админ поменял список игроков после /balance,
+    # старые составы уже не актуальны.
+    clear_saved_teams(match_id)
+
 
 def remove_match_player(match_id: int, player_id: int) -> None:
     db.execute(
@@ -662,10 +680,14 @@ def remove_match_player(match_id: int, player_id: int) -> None:
     )
     db.commit()
 
+    # После изменения списка игроков сохраненные составы очищаются.
+    clear_saved_teams(match_id)
+
 
 def clear_match_players(match_id: int) -> None:
     db.execute("DELETE FROM match_players WHERE match_id = ?", (match_id,))
     db.commit()
+    clear_saved_teams(match_id)
 
 
 def get_selected_player_ids(match_id: int) -> set[int]:
@@ -705,6 +727,200 @@ def get_match_players(match_id: int, status: Optional[str] = None) -> list[Playe
         ).fetchall()
 
     return [row_to_player(row) for row in rows]
+
+
+
+def clear_saved_teams(match_id: int) -> None:
+    """Удаляет сохраненные составы для матча."""
+    db.execute("DELETE FROM match_team_players WHERE match_id = ?", (match_id,))
+    db.commit()
+
+
+def save_match_teams(match_id: int, teams: list[list[Player]]) -> None:
+    """Сохраняет составы после /balance или /shuffle, чтобы админ мог их менять."""
+    db.execute("DELETE FROM match_team_players WHERE match_id = ?", (match_id,))
+
+    for team_index, team in enumerate(teams):
+        for position_in_team, player in enumerate(team, start=1):
+            db.execute(
+                """
+                INSERT INTO match_team_players (
+                    match_id, player_id, team_index, position_in_team, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    match_id,
+                    player.telegram_id,
+                    team_index,
+                    position_in_team,
+                    now_iso(),
+                ),
+            )
+
+    db.commit()
+
+
+def get_saved_teams(match_id: int) -> list[list[Player]]:
+    """Возвращает сохраненные составы после /balance."""
+    rows = db.execute(
+        """
+        SELECT p.*, mt.team_index, mt.position_in_team
+        FROM match_team_players mt
+        JOIN players p ON p.telegram_id = mt.player_id
+        WHERE mt.match_id = ?
+        ORDER BY mt.team_index ASC, mt.position_in_team ASC
+        """,
+        (match_id,),
+    ).fetchall()
+
+    match = get_match_by_id(match_id)
+    team_count = 2
+    if match:
+        team_count, _players_per_team = get_match_format(match)
+
+    max_index = max((int(row["team_index"]) for row in rows), default=-1)
+    teams: list[list[Player]] = [[] for _ in range(max(team_count, max_index + 1))]
+
+    for row in rows:
+        team_index = int(row["team_index"])
+        while team_index >= len(teams):
+            teams.append([])
+        teams[team_index].append(row_to_player(row))
+
+    return teams
+
+
+def has_saved_teams(match_id: int) -> bool:
+    row = db.execute(
+        "SELECT COUNT(*) AS count FROM match_team_players WHERE match_id = ?",
+        (match_id,),
+    ).fetchone()
+    return bool(row and int(row["count"]) > 0)
+
+
+def manual_lineup_help(team_count: int) -> str:
+    """Короткая подсказка для админа после /balance."""
+    if team_count == 2:
+        return (
+            "✏️ **Изменить составы после /balance:**\n"
+            "`/swap 3 5` — поменять 3-го игрока команды A с 5-м игроком команды B\n"
+            "`/swap 1 3 2 5` — полный вариант: команда 1 игрок 3 ↔ команда 2 игрок 5\n"
+            "`/lineups` — показать текущие составы"
+        )
+
+    return (
+        "✏️ **Изменить составы после /balance:**\n"
+        "`/swap 1 3 2 5` — команда 1 игрок 3 ↔ команда 2 игрок 5\n"
+        "`/lineups` — показать текущие составы"
+    )
+
+
+def get_saved_team_player(teams: list[list[Player]], team_number: int, player_number: int) -> Player:
+    team_index = team_number - 1
+    player_index = player_number - 1
+
+    if team_index < 0 or team_index >= len(teams):
+        raise ValueError(f"Команды #{team_number} нет.")
+
+    team = teams[team_index]
+    if player_index < 0 or player_index >= len(team):
+        raise ValueError(f"В команде #{team_number} нет игрока под номером {player_number}.")
+
+    return team[player_index]
+
+
+def parse_swap_command(text: str, team_count: int) -> tuple[int, int, int, int]:
+    parts = (text or "").split()
+
+    # Для 2 команд можно коротко: /swap 3 5
+    if len(parts) == 3 and team_count == 2:
+        try:
+            return 1, int(parts[1]), 2, int(parts[2])
+        except ValueError as exc:
+            raise ValueError("Номера должны быть числами.") from exc
+
+    # Полный вариант: /swap 1 3 2 5
+    if len(parts) == 5:
+        try:
+            return int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+        except ValueError as exc:
+            raise ValueError("Номера должны быть числами.") from exc
+
+    if team_count == 2:
+        raise ValueError(
+            "Формат: `/swap 3 5` или `/swap 1 3 2 5`\n"
+            "Пример: `/swap 3 5` — 3-й игрок команды A меняется с 5-м игроком команды B."
+        )
+
+    raise ValueError(
+        "Формат: `/swap 1 3 2 5`\n"
+        "Пример: команда 1 игрок 3 меняется с командой 2 игрок 5."
+    )
+
+
+def swap_saved_players(match_id: int, team_1: int, player_1: int, team_2: int, player_2: int) -> tuple[Player, Player, list[list[Player]]]:
+    teams = get_saved_teams(match_id)
+    first = get_saved_team_player(teams, team_1, player_1)
+    second = get_saved_team_player(teams, team_2, player_2)
+
+    team_index_1 = team_1 - 1
+    player_index_1 = player_1 - 1
+    team_index_2 = team_2 - 1
+    player_index_2 = player_2 - 1
+
+    teams[team_index_1][player_index_1], teams[team_index_2][player_index_2] = (
+        teams[team_index_2][player_index_2],
+        teams[team_index_1][player_index_1],
+    )
+
+    save_match_teams(match_id, teams)
+    return first, second, teams
+
+
+def parse_move_command(text: str) -> tuple[int, int, int]:
+    parts = (text or "").split()
+    if len(parts) != 4:
+        raise ValueError(
+            "Формат: `/move 1 3 2`\n"
+            "Пример: перенести 3-го игрока из команды 1 в команду 2."
+        )
+
+    try:
+        return int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError as exc:
+        raise ValueError("Номера должны быть числами.") from exc
+
+
+def move_saved_player(match: sqlite3.Row, from_team: int, player_number: int, to_team: int) -> tuple[Player, list[list[Player]]]:
+    match_id = int(match["id"])
+    teams = get_saved_teams(match_id)
+
+    if from_team == to_team:
+        raise ValueError("Игрок уже в этой команде.")
+
+    player = get_saved_team_player(teams, from_team, player_number)
+
+    from_index = from_team - 1
+    to_index = to_team - 1
+    player_index = player_number - 1
+
+    if to_index < 0 or to_index >= len(teams):
+        raise ValueError(f"Команды #{to_team} нет.")
+
+    _team_count, players_per_team = get_match_format(match)
+    if players_per_team > 0 and len(teams[to_index]) >= players_per_team:
+        raise ValueError(
+            f"Команда #{to_team} уже полная.\n"
+            "Для равных составов используйте `/swap`, например `/swap 1 3 2 5`."
+        )
+
+    teams[from_index].pop(player_index)
+    teams[to_index].append(player)
+
+    save_match_teams(match_id, teams)
+    return player, teams
+
 
 
 def short_name(player: Player, limit: int = 22) -> str:
@@ -1144,10 +1360,24 @@ TEAM_NAMES = [
 
 def format_team(name: str, team: list[Player]) -> str:
     lines = [f"**{name}**"]
+
+    # Состав показываем коротко: имя, позиция, общий рейтинг.
     for index, player in enumerate(team, 1):
         lines.append(
             f"{index}. {player.name} — {position_text(player.main_position)} — ⭐ {player.overall_rating}"
         )
+
+    # А ниже возвращаем общую статистику команды.
+    metrics = team_metrics(team)
+    lines.append("")
+    lines.append(f"Средний рейтинг: {metrics['overall']}")
+    lines.append(
+        f"Атака: {metrics['attack']} | "
+        f"Защита: {metrics['defense']} | "
+        f"Скорость: {metrics['speed']} | "
+        f"Ворота: {metrics['gk']}"
+    )
+
     return "\n".join(lines)
 
 
@@ -1174,13 +1404,15 @@ async def start_handler(_: Client, message: Message) -> None:
             "Админ может создавать/редактировать игроков:\n"
             "/admin_new_player — создать игрока вручную\n"
             "/edit_player — изменить характеристики игрока\n\n"
-            "Матч и список игроков выбирает только админ в группе."
+            "Матч и список игроков выбирает только админ в группе.\n"
+            "После /balance админ может менять составы: /swap и /lineups."
         )
     else:
         text = (
             "⚽ Бот работает.\n\n"
             "Игроки создают профиль в личке бота: /new_profile\n"
-            "Матч и список игроков выбирает только админ."
+            "Матч и список игроков выбирает только админ.\n"
+            "После /balance админ может менять составы команд: /swap и /lineups."
         )
     await message.reply_text(text)
 
@@ -1653,7 +1885,8 @@ async def balance_handler(_: Client, message: Message) -> None:
 
     team_count, players_per_team = get_match_format(active)
     teams = balance_n_teams(players, team_count=team_count, players_per_team=players_per_team, shuffle=False)
-    await message.reply_text(format_balanced_teams_n(teams))
+    save_match_teams(int(active["id"]), teams)
+    await message.reply_text(format_balanced_teams_n(teams) + "\n\n" + manual_lineup_help(len(teams)))
 
 
 @app.on_message(filters.group & filters.command("shuffle"))
@@ -1674,7 +1907,91 @@ async def shuffle_handler(_: Client, message: Message) -> None:
 
     team_count, players_per_team = get_match_format(active)
     teams = balance_n_teams(players, team_count=team_count, players_per_team=players_per_team, shuffle=True)
-    await message.reply_text("🔄 Новый вариант:\n\n" + format_balanced_teams_n(teams))
+    save_match_teams(int(active["id"]), teams)
+    await message.reply_text("🔄 Новый вариант:\n\n" + format_balanced_teams_n(teams) + "\n\n" + manual_lineup_help(len(teams)))
+
+
+
+@app.on_message(filters.group & filters.command(["lineups", "teams_now", "sostav"]))
+async def lineups_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    if not has_saved_teams(int(active["id"])):
+        await message.reply_text("Составы еще не сохранены. Сначала сделайте /balance")
+        return
+
+    teams = get_saved_teams(int(active["id"]))
+    await message.reply_text(format_balanced_teams_n(teams) + "\n\n" + manual_lineup_help(len(teams)))
+
+
+@app.on_message(filters.group & filters.command(["swap", "change"]))
+async def swap_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    match_id = int(active["id"])
+    if not has_saved_teams(match_id):
+        await message.reply_text("Сначала сделайте /balance, потом можно менять составы через /swap.")
+        return
+
+    team_count, _players_per_team = get_match_format(active)
+
+    try:
+        team_1, player_1, team_2, player_2 = parse_swap_command(message.text or "", team_count)
+        first, second, teams = swap_saved_players(match_id, team_1, player_1, team_2, player_2)
+    except ValueError as exc:
+        await message.reply_text("❌ " + str(exc))
+        return
+
+    await message.reply_text(
+        f"✅ Поменял игроков:\n"
+        f"{first.name} ↔ {second.name}\n\n"
+        + format_balanced_teams_n(teams)
+        + "\n\n"
+        + manual_lineup_help(len(teams))
+    )
+
+
+@app.on_message(filters.group & filters.command(["move", "transfer"]))
+async def move_handler(_: Client, message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    active = get_open_match(message.chat.id)
+    if not active:
+        await message.reply_text("Пока нет открытого матча. Сначала /create_match")
+        return
+
+    match_id = int(active["id"])
+    if not has_saved_teams(match_id):
+        await message.reply_text("Сначала сделайте /balance, потом можно переносить игроков через /move.")
+        return
+
+    try:
+        from_team, player_number, to_team = parse_move_command(message.text or "")
+        player, teams = move_saved_player(active, from_team, player_number, to_team)
+    except ValueError as exc:
+        await message.reply_text("❌ " + str(exc))
+        return
+
+    await message.reply_text(
+        f"✅ Перенес игрока: {player.name}\n"
+        f"Из команды {from_team} → в команду {to_team}\n\n"
+        + format_balanced_teams_n(teams)
+        + "\n\n"
+        + manual_lineup_help(len(teams))
+    )
 
 
 @app.on_message(filters.group & filters.command("reset_match"))
@@ -1687,6 +2004,7 @@ async def reset_match_handler(_: Client, message: Message) -> None:
         await message.reply_text("Открытого матча нет.")
         return
 
+    clear_saved_teams(int(active["id"]))
     db.execute(
         "UPDATE matches SET status = 'cancelled' WHERE id = ?",
         (active["id"],),
